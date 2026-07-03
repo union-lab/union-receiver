@@ -1,0 +1,19 @@
+[project]
+name = "union-davinci-task"
+version = "0.1.0"
+description = "达芬奇做图工单队列 worker"
+requires-python = ">=3.11"
+dependencies = [
+  "asyncpg>=0.29.0",
+  "fastapi>=0.110.0",
+  "pydantic>=2.7.0",
+  "pydantic-settings>=2.2.0",
+  "python-dotenv>=1.0.1",
+]
+
+[project.scripts]
+union-davinci-task = "union_davinci_task.worker:main"
+
+[tool.ruff]
+line-length = 100
+

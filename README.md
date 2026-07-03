@@ -36,6 +36,19 @@ bash run.sh
 DAVINCI_TASK_INTERVAL_SECONDS=300 bash run.sh
 ```
 
+## 数据库
+
+worker 默认复用 `union-agent` 环境文件里的 `DATABASE_URL`，但只把数据库名切到
+`union_prod`，不写死账号、密码、主机：
+
+```bash
+DAVINCI_TASK_DATABASE_NAME=union_prod bash run.sh --once
+```
+
+达芬奇相关 SQL 通过 `union-agent` 的 `get_davinci_pool()` 使用独立连接池，
+默认 `search_path=davinci,public,app`。不要修改全局 `get_pool()` 的
+`search_path`，否则会影响全系统其他路由。
+
 ## 路径说明
 
 默认自动使用同级目录：

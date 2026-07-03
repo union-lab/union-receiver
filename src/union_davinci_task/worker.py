@@ -10,6 +10,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import BackgroundTasks
 
@@ -47,6 +48,25 @@ def _load_env_file(path: Path, *, override: bool = False) -> None:
             os.environ[key] = value
 
 
+def _database_url_with_name(dsn: str, database_name: str) -> str:
+    if not database_name:
+        return dsn
+    parsed = urlsplit(dsn)
+    if not parsed.scheme or not parsed.netloc:
+        return dsn
+    return urlunsplit((parsed.scheme, parsed.netloc, f"/{database_name}", parsed.query, parsed.fragment))
+
+
+def _force_database_name(database_name: str) -> None:
+    dsn = os.environ.get("DATABASE_URL")
+    if not dsn or not database_name:
+        return
+    updated = _database_url_with_name(dsn, database_name)
+    if updated != dsn:
+        os.environ["DATABASE_URL"] = updated
+        logger.info("达芬奇工单 worker 数据库已切换到：%s", database_name)
+
+
 def bootstrap_agent(settings: TaskSettings):
     """导入 union-agent，让 worker 直接复用原达芬奇做图逻辑。"""
     if not settings.agent_path.exists():
@@ -67,11 +87,12 @@ def bootstrap_agent(settings: TaskSettings):
         os.environ.setdefault("DAVINCI_CORE_PATH", str(davinci_core_path))
     _load_env_file(settings.agent_path / settings.agent_env_file)
     _load_env_file(settings.agent_path / ".env", override=False)
+    _force_database_name(settings.database_name)
 
     from app.api.routes import davinci
-    from app.db.pool import close_pool, get_pool
+    from app.db.davinci_pool import close_davinci_pool, get_davinci_pool
 
-    return davinci, get_pool, close_pool
+    return davinci, get_davinci_pool, close_davinci_pool
 
 
 def _json_dumps(data: Any) -> str:
@@ -529,6 +550,7 @@ async def async_main(args: argparse.Namespace) -> None:
             interval_seconds=max(10, args.interval),
             batch_size=settings.batch_size,
             agent_env_file=settings.agent_env_file,
+            database_name=settings.database_name,
         )
     if args.batch_size:
         settings = TaskSettings(
@@ -537,6 +559,7 @@ async def async_main(args: argparse.Namespace) -> None:
             interval_seconds=settings.interval_seconds,
             batch_size=max(1, args.batch_size),
             agent_env_file=settings.agent_env_file,
+            database_name=settings.database_name,
         )
 
     if args.once:

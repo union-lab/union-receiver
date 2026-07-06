@@ -20,7 +20,7 @@
 推荐直接复用 `union-agent` 的虚拟环境：
 
 ```bash
-cd /Users/echo/Documents/Codex/2026-06-18/union-davinci-task
+cd /Users/echo/Documents/Codex/2026-06-18/union-lab-union-receiver-git-https
 bash run.sh --once
 ```
 
@@ -51,10 +51,36 @@ DAVINCI_TASK_DATABASE_NAME=union_prod bash run.sh --once
 
 ## 路径说明
 
-默认自动使用同级目录：
+worker 可通过 `UNION_AGENT_TARGET` 在两个 agent 项目之间切换：
 
-- `../union-lab-union-agent-git-https`
-- `../union-lab-union-knowledgebase-git-https`
+- `dev`：`../union-lab-union-agent-git-https`，开发测试用。
+- `runtime`：`../union-lab-union-agent-davinci-runtime`，正式运行用。
+
+默认数据库也会跟着目标切换：
+
+- `dev`：`union_dev`
+- `runtime`：`union_prod`
+
+示例：
+
+```bash
+UNION_AGENT_TARGET=dev bash run.sh --once
+UNION_AGENT_TARGET=runtime bash run.sh --once
+```
+
+也可以使用便捷脚本：
+
+```bash
+bash run-dev-agent.sh --once
+bash run-runtime-agent.sh --once
+```
+
+常驻 worker 如需切换目标：
+
+```bash
+bash restart-worker-target.sh dev
+bash restart-worker-target.sh runtime
+```
 
 如果目录不同，用环境变量覆盖：
 

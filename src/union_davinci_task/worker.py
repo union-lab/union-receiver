@@ -290,6 +290,19 @@ async def _run_background_tasks(background_tasks: BackgroundTasks) -> None:
 
 def _build_generate_request(davinci: Any, config: dict[str, Any], compile_resp: Any) -> Any:
     store = _extract_store(config)
+    product_evidence_refs = _as_list(config.get("product_evidence_refs"))
+    reference_manifest = list(getattr(compile_resp, "reference_manifest", None) or [])
+    if not reference_manifest:
+        reference_manifest = _as_list(config.get("reference_manifest"))
+    evidence_policy = _text(config.get("evidence_policy"), "collector_or_upload")
+    preflight = _as_dict(config.get("preflight"))
+    primary_product = _as_dict(preflight.get("primary_product"))
+    has_system_product_evidence = bool(
+        primary_product.get("has_image")
+        and (primary_product.get("evidence_source") or primary_product.get("evidence_url"))
+    )
+    if evidence_policy == "upload_only" and not product_evidence_refs and has_system_product_evidence:
+        evidence_policy = "default"
     return davinci.GenerateRequest(
         kingdee_code=_kingdee_code(config),
         recipe_code=_extract_recipe(config),
@@ -302,9 +315,9 @@ def _build_generate_request(davinci: Any, config: dict[str, Any], compile_resp: 
         config_hash=compile_resp.config_hash,
         gate_snapshot=compile_resp.gate_snapshot,
         model_call_spec=compile_resp.model_call_spec,
-        reference_manifest=list(compile_resp.reference_manifest or []),
-        product_evidence_refs=_as_list(config.get("product_evidence_refs")),
-        evidence_policy=_text(config.get("evidence_policy"), "collector_or_upload"),
+        reference_manifest=reference_manifest,
+        product_evidence_refs=product_evidence_refs,
+        evidence_policy=evidence_policy,
         store_id=_text(store.get("id") or store.get("store_id") or store.get("shop_no")) or None,
         shop_no=_text(store.get("shop_no")) or None,
         shop_name=_text(store.get("shop_name") or store.get("name")) or None,
@@ -332,8 +345,8 @@ def _collect_urls(status: dict[str, Any]) -> list[str]:
         add(output.get(key))
 
     output_id = _text(output.get("id") or output.get("output_id"))
-    if output_id:
-        add(f"/api/davinci-public/outputs/{output_id}/image")
+    if output_id and not urls:
+        add(f"/api/davinci/outputs/{output_id}/image")
     return urls
 
 
@@ -432,6 +445,14 @@ async def claim_orders(davinci: Any, get_pool: Any, limit: int) -> list[dict[str
                 SELECT id
                 FROM union_davinci_draworder
                 WHERE status = '待做图'
+                  AND COALESCE(config->>'cancelled', 'false') <> 'true'
+                  AND (
+                    CASE
+                      WHEN COALESCE(config->>'attempt_count', '') ~ '^[0-9]+$'
+                        THEN (config->>'attempt_count')::int
+                      ELSE 0
+                    END
+                  ) < 3
                 ORDER BY created_at ASC
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED

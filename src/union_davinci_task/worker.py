@@ -17,6 +17,7 @@ from fastapi import BackgroundTasks
 from .config import TaskSettings, load_settings
 
 logger = logging.getLogger("union-davinci-task")
+MAX_DRAW_ORDER_ATTEMPTS = 2
 
 
 def _setup_logging() -> None:
@@ -159,6 +160,59 @@ def _extract_pipeline(config: dict[str, Any]) -> str | None:
     tier = _as_dict(config.get("business_tier"))
     pipeline = tier.get("runtime_pipeline") or config.get("runtime_pipeline") or config.get("pipeline")
     return _text(pipeline) or None
+
+
+def _normalize_pipeline(value: Any) -> str:
+    raw = _text(value).lower()
+    if not raw:
+        return ""
+    compact = raw.replace(" ", "").replace("_", "").replace("-", "")
+    if compact.startswith("c") or "pil" in compact or "html" in compact:
+        return "C"
+    if compact.startswith("b+") or "bplus" in compact:
+        return "B+"
+    if compact.startswith("b") or "直出" in raw:
+        return "B"
+    return ""
+
+
+def _recipe_pipeline(davinci: Any, recipe: str) -> str:
+    resolver = getattr(davinci, "recipe_pipeline_kind", None)
+    if not callable(resolver):
+        return ""
+    try:
+        kind = resolver(recipe)
+    except Exception:
+        return ""
+    if kind == "pil_c":
+        return "C"
+    if kind == "ai_b":
+        return "B"
+    return ""
+
+
+def _resolve_generate_pipeline(davinci: Any, config: dict[str, Any], compile_resp: Any) -> str:
+    recipe = _extract_recipe(config)
+    recipe_pipeline = _recipe_pipeline(davinci, recipe)
+    compile_pipeline = _normalize_pipeline(getattr(compile_resp, "pipeline", None))
+    config_pipeline = _normalize_pipeline(_extract_pipeline(config))
+
+    if recipe_pipeline and compile_pipeline and recipe_pipeline != compile_pipeline:
+        raise RuntimeError(
+            f"出图管线冲突：Recipe {recipe} 要求 {recipe_pipeline}，compile-plan 返回 {compile_pipeline}"
+        )
+    if recipe_pipeline and config_pipeline and recipe_pipeline != config_pipeline:
+        raise RuntimeError(
+            f"出图管线冲突：Recipe {recipe} 要求 {recipe_pipeline}，工单配置为 {config_pipeline}"
+        )
+
+    pipeline = recipe_pipeline or compile_pipeline or config_pipeline
+    if pipeline not in {"B", "C"}:
+        raise RuntimeError(
+            f"不支持或缺失的出图管线：recipe={recipe} config_pipeline={_extract_pipeline(config)!r} "
+            f"compile_pipeline={getattr(compile_resp, 'pipeline', None)!r}"
+        )
+    return pipeline
 
 
 def _extract_subject_focus(config: dict[str, Any]) -> str | None:
@@ -332,6 +386,37 @@ def _build_generate_request(davinci: Any, config: dict[str, Any], compile_resp: 
     )
 
 
+def _build_generate_c_request(davinci: Any, config: dict[str, Any], compile_resp: Any) -> Any:
+    store = _extract_store(config)
+    reference_manifest = list(getattr(compile_resp, "reference_manifest", None) or [])
+    if not reference_manifest:
+        reference_manifest = _as_list(config.get("reference_manifest"))
+    return davinci.GenerateCRequest(
+        kingdee_code=_kingdee_code(config),
+        recipe_code=_extract_recipe(config),
+        platform=_extract_platform(config),
+        image_type=_extract_image_type(config),
+        business_tier=_extract_business_tier(config),
+        provider="gemini",
+        selling_points=_selling_points(config),
+        compile_id=compile_resp.compile_id,
+        config_hash=compile_resp.config_hash,
+        gate_snapshot=compile_resp.gate_snapshot,
+        model_call_spec=compile_resp.model_call_spec,
+        reference_manifest=reference_manifest,
+        product_evidence_refs=_as_list(config.get("product_evidence_refs")),
+        image_purpose="main_combo",
+        store_id=_text(store.get("id") or store.get("store_id") or store.get("shop_no")) or None,
+        shop_no=_text(store.get("shop_no")) or None,
+        shop_name=_text(store.get("shop_name") or store.get("name")) or None,
+        biz_unit=_text(store.get("biz_unit")) or None,
+        combo_member_codes=_as_list(config.get("combo_member_codes")),
+        combo_generation_mode=_text(config.get("combo_generation_mode"), "suite"),
+        subject_focus=_extract_subject_focus(config),
+        task_level="L3",
+    )
+
+
 def _collect_urls(status: dict[str, Any]) -> list[str]:
     output = _as_dict(status.get("output"))
     urls: list[str] = []
@@ -354,9 +439,16 @@ def _collect_urls(status: dict[str, Any]) -> list[str]:
 
 
 async def _generate_with_existing_logic(davinci: Any, config: dict[str, Any], compile_resp: Any) -> list[str]:
-    req = _build_generate_request(davinci, config, compile_resp)
+    pipeline = _resolve_generate_pipeline(davinci, config, compile_resp)
+    if pipeline == "C":
+        req = _build_generate_c_request(davinci, config, compile_resp)
+        entrypoint = davinci.generate_c
+    else:
+        req = _build_generate_request(davinci, config, compile_resp)
+        entrypoint = davinci.generate
     background_tasks = BackgroundTasks()
-    created = await davinci.generate(req, background_tasks)
+    logger.info("按工单配置选择达芬奇出图管线 pipeline=%s recipe=%s", pipeline, _extract_recipe(config))
+    created = await entrypoint(req, background_tasks)
     task_id = created["task_id"]
 
     await _run_background_tasks(background_tasks)
@@ -442,6 +534,30 @@ async def claim_orders(davinci: Any, get_pool: Any, limit: int) -> list[dict[str
     await davinci._ensure_task_table()
     pool = await get_pool()
     async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE union_davinci_draworder
+            SET status = '已取消',
+                config = COALESCE(config, '{}'::jsonb) || jsonb_build_object(
+                    'cancelled', true,
+                    'cancelled_by', 'union-davinci-task',
+                    'cancelled_at', to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+                    'cancel_reason', $1::text
+                ),
+                updated_at = now()
+            WHERE status = '待做图'
+              AND COALESCE(config->>'cancelled', 'false') <> 'true'
+              AND (
+                CASE
+                  WHEN COALESCE(config->>'attempt_count', '') ~ '^[0-9]+$'
+                    THEN (config->>'attempt_count')::int
+                  ELSE 0
+                END
+              ) >= $2::int
+            """,
+            f"自动取消：失败次数达到 {MAX_DRAW_ORDER_ATTEMPTS} 次",
+            MAX_DRAW_ORDER_ATTEMPTS,
+        )
         rows = await conn.fetch(
             """
             WITH picked AS (
@@ -455,7 +571,7 @@ async def claim_orders(davinci: Any, get_pool: Any, limit: int) -> list[dict[str
                         THEN (config->>'attempt_count')::int
                       ELSE 0
                     END
-                  ) < 3
+                  ) < $2
                 ORDER BY created_at ASC
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
@@ -470,6 +586,7 @@ async def claim_orders(davinci: Any, get_pool: Any, limit: int) -> list[dict[str
                       d.config, d.output_urls, d.created_at
             """,
             limit,
+            MAX_DRAW_ORDER_ATTEMPTS,
         )
     return [dict(row) for row in rows]
 
@@ -496,20 +613,29 @@ async def mark_failed_for_retry(get_pool: Any, order: dict[str, Any], error: Exc
     config = _as_dict(order.get("config")).copy()
     config["last_error"] = str(error)
     config["last_failed_at"] = datetime.now(timezone.utc).isoformat()
-    config["attempt_count"] = int(config.get("attempt_count") or 0) + 1
+    attempt_count = int(config.get("attempt_count") or 0) + 1
+    config["attempt_count"] = attempt_count
+    next_status = "待做图"
+    if attempt_count >= MAX_DRAW_ORDER_ATTEMPTS:
+        next_status = "已取消"
+        config["cancelled"] = True
+        config["cancelled_at"] = datetime.now(timezone.utc).isoformat()
+        config["cancelled_by"] = "union-davinci-task"
+        config["cancel_reason"] = f"自动取消：失败次数达到 {MAX_DRAW_ORDER_ATTEMPTS} 次"
 
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
             """
             UPDATE union_davinci_draworder
-            SET status = '待做图',
+            SET status = $3,
                 config = $2::jsonb,
                 updated_at = now()
             WHERE id = $1
             """,
             int(order["id"]),
             _json_dumps(config),
+            next_status,
         )
 
 
@@ -521,11 +647,11 @@ async def process_order(davinci: Any, get_pool: Any, order: dict[str, Any]) -> N
     config = _as_dict(order.get("config"))
     try:
         compile_resp = await _compile_with_existing_logic(davinci, config)
-        urls = await _generate_with_foreign_then_cn_fallback(davinci, config, compile_resp)
+        urls = await _generate_with_existing_logic(davinci, config, compile_resp)
         await mark_completed(get_pool, order_id, urls)
         logger.info("工单完成 id=%s urls=%s", order_id, urls)
     except Exception as exc:
-        logger.exception("工单失败，退回待做图 id=%s: %s", order_id, exc)
+        logger.exception("工单失败，按重试策略更新状态 id=%s: %s", order_id, exc)
         await mark_failed_for_retry(get_pool, order, exc)
 
 

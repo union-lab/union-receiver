@@ -76,15 +76,18 @@ def bootstrap_agent(settings: TaskSettings):
 
     os.environ.setdefault("UNION_AGENT_ENV_FILE", settings.agent_env_file)
     os.environ.setdefault("UNION_KNOWLEDGEBASE_PATH", str(settings.knowledgebase_path))
-    davinci_core_path = (
+    vendored_core_path = settings.agent_path / "davinci_core_vendored"
+    knowledgebase_core_path = (
         settings.knowledgebase_path
         / "重点项目"
         / "AI部门"
         / "AI美工师·达芬奇"
         / "davinci_core"
     )
-    if davinci_core_path.exists():
-        os.environ.setdefault("DAVINCI_CORE_PATH", str(davinci_core_path))
+    if (vendored_core_path / "lib").exists():
+        os.environ.setdefault("DAVINCI_CORE_PATH", str(vendored_core_path))
+    elif knowledgebase_core_path.exists():
+        os.environ.setdefault("DAVINCI_CORE_PATH", str(knowledgebase_core_path))
     _load_env_file(settings.agent_path / settings.agent_env_file)
     _load_env_file(settings.agent_path / ".env", override=False)
     _force_database_name(settings.database_name)
